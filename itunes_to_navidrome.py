@@ -29,6 +29,7 @@ import plistlib
 import sys
 import os
 import unicodedata
+import html
 from datetime import datetime
 from urllib.parse import unquote, urlparse
 import argparse
@@ -117,6 +118,10 @@ def extract_path_from_itunes_location(itunes_location: str) -> str:
 
     # Get the path portion and URL-decode it
     path = unquote(parsed.path)
+
+    # Decode XML/HTML entities (e.g., &#38; -> &, &#39; -> ')
+    # iTunes Library.xml uses these for special characters
+    path = html.unescape(path)
 
     # Normalize Unicode (macOS NFD -> NFC)
     path = normalize_unicode(path)
