@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 iTunes to Navidrome Migration Script
-Transfers play counts, ratings, and play dates from iTunes Library.xml to Navidrome
+Transfers play counts, ratings, play dates, playlists, and date-added timestamps
+from iTunes Library.xml to Navidrome.
 
 Tested with: Navidrome 0.55+ / 0.58+ (with multi-library support)
 Author: Claude (Anthropic) - January 2026
@@ -10,10 +11,26 @@ License: Public Domain
 Usage:
     python itunes_to_navidrome.py [navidrome.db] [Library.xml] [navidrome_user_id]
 
-    If arguments are omitted, the script will prompt for them interactively.
+    If arguments are omitted, the script will:
+    1. Auto-scan the current directory for navidrome.db and iTunes XML files
+    2. Prompt you to confirm or enter different paths
+    3. Show an interactive options screen to select what to import
 
 Example:
     python itunes_to_navidrome.py navidrome.db "iTunes Library.xml" abc123
+
+    # Import playlists (non-interactive)
+    python itunes_to_navidrome.py navidrome.db "Library.xml" abc123 --import-playlists
+
+    # Import date-added timestamps
+    python itunes_to_navidrome.py navidrome.db "Library.xml" abc123 --import-date-added
+
+IMPORT OPTIONS (all selectable individually):
+1. Play counts - Number of times each track was played
+2. Ratings - Star ratings (1-5 stars)
+3. Play dates - Last played timestamps
+4. Date added - When tracks were added to library
+5. Playlists - Creates playlists in Navidrome (smart playlists skipped)
 
 IMPORTANT NOTES:
 - Play counts are ADDED to existing counts by default. Use --replace to overwrite instead.
@@ -22,6 +39,8 @@ IMPORTANT NOTES:
 - Always backup navidrome.db before running.
 - Path matching uses suffix matching - iTunes paths are matched to Navidrome paths
   by finding the longest matching path suffix.
+- Smart playlists are not imported (they cannot be converted to static playlists).
+- Existing playlists with the same name are skipped.
 """
 
 import sqlite3
@@ -30,11 +49,24 @@ import sys
 import os
 import unicodedata
 import html
+import string
+import random
+from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import unquote, urlparse
 import argparse
 import logging
 from collections import defaultdict
+
+
+@dataclass
+class ImportOptions:
+    """Options for what data to import from iTunes to Navidrome."""
+    import_play_counts: bool = True
+    import_ratings: bool = True
+    import_play_dates: bool = True
+    import_date_added: bool = False
+    import_playlists: bool = False
 
 # Logger will be configured in main() after log directory is created
 logger = logging.getLogger(__name__)
@@ -67,17 +99,35 @@ def setup_logging(log_dir: str, verbose: bool = False):
     file_handler = logging.FileHandler(log_file)
     stream_handler = logging.StreamHandler()
 
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    stream_handler.setFormatter(formatter)
+    # File: detailed with timestamps
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    # Console: clean, just the message
+    console_formatter = logging.Formatter('%(message)s')
+
+    file_handler.setFormatter(file_formatter)
+    stream_handler.setFormatter(console_formatter)
 
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
     logger.setLevel(log_level)
 
 
-def parse_itunes_library(xml_path: str) -> dict:
-    """Parse iTunes Library.xml and return track dictionary."""
+def log_and_print(message: str):
+    """Output message to both console and log file."""
+    print(message)
+    # Strip formatting chars for cleaner log output
+    clean_message = message.lstrip('= -').rstrip('= -').strip()
+    if clean_message:
+        logger.info(clean_message)
+
+
+def parse_itunes_library(xml_path: str, include_playlists: bool = False):
+    """
+    Parse iTunes Library.xml and return track dictionary.
+
+    If include_playlists is True, returns (tracks, playlists) tuple.
+    Otherwise returns just tracks dict.
+    """
     logger.info(f"Parsing iTunes library: {xml_path}")
 
     with open(xml_path, 'rb') as f:
@@ -86,7 +136,88 @@ def parse_itunes_library(xml_path: str) -> dict:
     tracks = library.get('Tracks', {})
     logger.info(f"Found {len(tracks)} tracks in iTunes library")
 
+    if include_playlists:
+        playlists = extract_playlists(library, tracks)
+        return tracks, playlists
+
     return tracks
+
+
+def is_smart_playlist(playlist: dict) -> bool:
+    """Check if a playlist is a smart playlist (auto-generated based on rules)."""
+    return 'Smart Info' in playlist or 'Smart Criteria' in playlist
+
+
+def is_system_playlist(playlist: dict) -> bool:
+    """
+    Check if a playlist is a system/built-in playlist.
+
+    System playlists include:
+    - Master library (Master=True)
+    - Distinguished Kind playlists (Music, Movies, TV Shows, Podcasts, etc.)
+    """
+    if playlist.get('Master'):
+        return True
+    if 'Distinguished Kind' in playlist:
+        return True
+    # Also skip "Library" named playlists that are folder-like
+    if playlist.get('Folder'):
+        return True
+    return False
+
+
+def extract_playlists(library: dict, tracks: dict) -> list:
+    """
+    Extract user playlists from iTunes library, skipping system and smart playlists.
+
+    Returns list of dicts with playlist info and resolved track data.
+    """
+    raw_playlists = library.get('Playlists', [])
+    user_playlists = []
+
+    skipped_smart = 0
+    skipped_system = 0
+
+    for playlist in raw_playlists:
+        name = playlist.get('Name', 'Unnamed')
+
+        # Skip system playlists
+        if is_system_playlist(playlist):
+            skipped_system += 1
+            logger.debug(f"Skipping system playlist: {name}")
+            continue
+
+        # Skip smart playlists
+        if is_smart_playlist(playlist):
+            skipped_smart += 1
+            logger.debug(f"Skipping smart playlist: {name}")
+            continue
+
+        # Get playlist items (track IDs)
+        items = playlist.get('Playlist Items', [])
+        if not items:
+            logger.debug(f"Skipping empty playlist: {name}")
+            continue
+
+        # Resolve track IDs to track data
+        playlist_tracks = []
+        for item in items:
+            track_id = str(item.get('Track ID'))
+            if track_id in tracks:
+                playlist_tracks.append(tracks[track_id])
+
+        if playlist_tracks:
+            user_playlists.append({
+                'name': name,
+                'tracks': playlist_tracks,
+                'playlist_id': playlist.get('Playlist ID'),
+                'persistent_id': playlist.get('Playlist Persistent ID')
+            })
+
+    logger.info(f"Found {len(user_playlists)} user playlists "
+                f"(skipped {skipped_smart} smart, {skipped_system} system)")
+
+    return user_playlists
 
 
 def normalize_unicode(text: str) -> str:
@@ -356,6 +487,7 @@ def migrate_track(
     stats: dict,
     not_found_paths: list,
     ambiguous_matches: list,
+    import_options: ImportOptions,
     replace_mode: bool = False,
     has_rated_at: bool = False
 ):
@@ -367,12 +499,13 @@ def migrate_track(
         stats['no_location'] += 1
         return False
 
-    play_count = itunes_track.get('Play Count', 0)
-    rating = convert_itunes_rating(itunes_track.get('Rating', 0))
-    play_date = convert_itunes_date(itunes_track.get('Play Date UTC'))
+    # Get data based on import options
+    play_count = itunes_track.get('Play Count', 0) if import_options.import_play_counts else 0
+    rating = convert_itunes_rating(itunes_track.get('Rating', 0)) if import_options.import_ratings else 0
+    play_date = convert_itunes_date(itunes_track.get('Play Date UTC')) if import_options.import_play_dates else None
 
-    # Skip if no meaningful data to migrate
-    if play_count == 0 and rating == 0:
+    # Skip if no meaningful data to migrate (based on selected options)
+    if play_count == 0 and rating == 0 and play_date is None:
         stats['no_data'] += 1
         return False
 
@@ -424,7 +557,8 @@ def check_track_for_dry_run(
     path_index: dict,
     stats: dict,
     not_found_paths: list,
-    ambiguous_matches: list
+    ambiguous_matches: list,
+    import_options: ImportOptions
 ):
     """Check if a track would match during dry run (mirrors migrate_track logic)."""
 
@@ -433,10 +567,12 @@ def check_track_for_dry_run(
         stats['no_location'] += 1
         return
 
-    play_count = itunes_track.get('Play Count', 0)
-    rating = convert_itunes_rating(itunes_track.get('Rating', 0))
+    # Get data based on import options
+    play_count = itunes_track.get('Play Count', 0) if import_options.import_play_counts else 0
+    rating = convert_itunes_rating(itunes_track.get('Rating', 0)) if import_options.import_ratings else 0
+    play_date = itunes_track.get('Play Date UTC') if import_options.import_play_dates else None
 
-    if play_count == 0 and rating == 0:
+    if play_count == 0 and rating == 0 and play_date is None:
         stats['no_data'] += 1
         return
 
@@ -454,6 +590,275 @@ def check_track_for_dry_run(
         not_found_paths.append(itunes_path)
 
 
+# =============================================================================
+# Date Added Import Functions
+# =============================================================================
+
+def update_media_file_date_added(conn: sqlite3.Connection, media_file_id: str, date_added: str):
+    """
+    Update media_file.created_at with iTunes 'Date Added' timestamp.
+
+    Args:
+        conn: Database connection
+        media_file_id: Navidrome media file ID
+        date_added: ISO format datetime string
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE media_file SET created_at = ? WHERE id = ?
+    """, (date_added, media_file_id))
+
+
+def migrate_date_added(
+    conn: sqlite3.Connection,
+    tracks: dict,
+    path_index: dict,
+    dry_run: bool = False
+) -> dict:
+    """
+    Import 'Date Added' timestamps from iTunes to Navidrome.
+
+    Returns stats dict with counts.
+    """
+    stats = {
+        'total': 0,
+        'updated': 0,
+        'no_date': 0,
+        'not_found': 0
+    }
+
+    for track in tracks.values():
+        stats['total'] += 1
+
+        # Get date added from iTunes
+        date_added = track.get('Date Added')
+        if not date_added:
+            stats['no_date'] += 1
+            continue
+
+        # Convert to ISO format
+        date_added_str = convert_itunes_date(date_added)
+        if not date_added_str:
+            stats['no_date'] += 1
+            continue
+
+        # Get file location
+        location = track.get('Location')
+        if not location:
+            continue
+
+        itunes_path = extract_path_from_itunes_location(location)
+        if not itunes_path:
+            continue
+
+        # Find matching file in Navidrome
+        media_file = find_matching_media_file(itunes_path, path_index)
+        if not media_file:
+            stats['not_found'] += 1
+            continue
+
+        # Update the date
+        if not dry_run:
+            update_media_file_date_added(conn, media_file['id'], date_added_str)
+
+        stats['updated'] += 1
+
+        if stats['total'] % 500 == 0:
+            logger.info(f"Processed {stats['total']} tracks...")
+
+    return stats
+
+
+# =============================================================================
+# Playlist Import Functions
+# =============================================================================
+
+# Base62 characters for Navidrome ID generation (same as Navidrome uses)
+BASE62_CHARS = string.ascii_letters + string.digits
+
+
+def generate_playlist_id() -> str:
+    """
+    Generate a 22-character base62 ID like Navidrome uses.
+
+    Navidrome uses nanoid-style IDs with base62 encoding.
+    """
+    return ''.join(random.choices(BASE62_CHARS, k=22))
+
+
+def playlist_exists(conn: sqlite3.Connection, name: str, owner_id: str) -> bool:
+    """Check if a playlist with the given name already exists for the user."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id FROM playlist WHERE name = ? AND owner_id = ?
+    """, (name, owner_id))
+    return cursor.fetchone() is not None
+
+
+def create_playlist(
+    conn: sqlite3.Connection,
+    name: str,
+    owner_id: str,
+    media_file_ids: list,
+    comment: str = ""
+) -> str:
+    """
+    Create a playlist and its track entries in Navidrome.
+
+    Args:
+        conn: Database connection
+        name: Playlist name
+        owner_id: Navidrome user ID
+        media_file_ids: List of media file IDs in order
+        comment: Optional playlist comment/description
+
+    Returns:
+        The created playlist ID
+    """
+    cursor = conn.cursor()
+    playlist_id = generate_playlist_id()
+    now = datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # Calculate duration by summing track durations
+    if media_file_ids:
+        placeholders = ','.join('?' * len(media_file_ids))
+        cursor.execute(f"""
+            SELECT COALESCE(SUM(duration), 0) FROM media_file WHERE id IN ({placeholders})
+        """, media_file_ids)
+        total_duration = cursor.fetchone()[0] or 0
+    else:
+        total_duration = 0
+
+    # Insert playlist record
+    cursor.execute("""
+        INSERT INTO playlist (id, name, comment, owner_id, public, song_count, duration, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+    """, (playlist_id, name, comment, owner_id, len(media_file_ids), total_duration, now, now))
+
+    # Insert playlist tracks with positions
+    for _, media_file_id in enumerate(media_file_ids):
+        track_entry_id = generate_playlist_id()
+        cursor.execute("""
+            INSERT INTO playlist_tracks (id, playlist_id, media_file_id)
+            VALUES (?, ?, ?)
+        """, (track_entry_id, playlist_id, media_file_id))
+
+    return playlist_id
+
+
+def migrate_playlist(
+    conn: sqlite3.Connection,
+    user_id: str,
+    playlist: dict,
+    path_index: dict,
+    stats: dict,
+    dry_run: bool = False
+) -> bool:
+    """
+    Import a single playlist from iTunes to Navidrome.
+
+    Args:
+        conn: Database connection
+        user_id: Navidrome user ID
+        playlist: Playlist dict with 'name' and 'tracks' keys
+        path_index: Navidrome path index for matching
+        stats: Stats dict to update
+        dry_run: If True, don't make changes
+
+    Returns:
+        True if playlist was created, False otherwise
+    """
+    name = playlist['name']
+    tracks = playlist['tracks']
+
+    # Check if playlist already exists
+    if not dry_run and playlist_exists(conn, name, user_id):
+        logger.warning(f"Playlist already exists, skipping: {name}")
+        stats['skipped_exists'] += 1
+        return False
+
+    # Match tracks to Navidrome media files
+    media_file_ids = []
+    unmatched = []
+
+    for track in tracks:
+        location = track.get('Location')
+        if not location:
+            continue
+
+        itunes_path = extract_path_from_itunes_location(location)
+        if not itunes_path:
+            continue
+
+        media_file = find_matching_media_file(itunes_path, path_index)
+        if media_file:
+            media_file_ids.append(media_file['id'])
+        else:
+            unmatched.append(itunes_path)
+
+    # Skip if no tracks matched
+    if not media_file_ids:
+        logger.warning(f"No tracks matched for playlist: {name} ({len(tracks)} tracks)")
+        stats['skipped_no_tracks'] += 1
+        return False
+
+    # Log partial matches
+    if unmatched:
+        logger.info(f"Playlist '{name}': {len(media_file_ids)}/{len(tracks)} tracks matched")
+        for path in unmatched[:5]:  # Log first 5 unmatched
+            logger.debug(f"  Unmatched: {path}")
+        if len(unmatched) > 5:
+            logger.debug(f"  ... and {len(unmatched) - 5} more unmatched tracks")
+
+    # Create the playlist
+    if not dry_run:
+        create_playlist(conn, name, user_id, media_file_ids)
+        logger.info(f"Created playlist: {name} ({len(media_file_ids)} tracks)")
+    else:
+        logger.info(f"Would create playlist: {name} ({len(media_file_ids)} tracks)")
+
+    stats['created'] += 1
+    stats['tracks_matched'] += len(media_file_ids)
+    stats['tracks_unmatched'] += len(unmatched)
+
+    return True
+
+
+def migrate_all_playlists(
+    conn: sqlite3.Connection,
+    user_id: str,
+    playlists: list,
+    path_index: dict,
+    dry_run: bool = False
+) -> dict:
+    """
+    Import all playlists from iTunes to Navidrome.
+
+    Args:
+        conn: Database connection
+        user_id: Navidrome user ID
+        playlists: List of playlist dicts from extract_playlists()
+        path_index: Navidrome path index for matching
+        dry_run: If True, don't make changes
+
+    Returns:
+        Stats dict with import results
+    """
+    stats = {
+        'total': len(playlists),
+        'created': 0,
+        'skipped_exists': 0,
+        'skipped_no_tracks': 0,
+        'tracks_matched': 0,
+        'tracks_unmatched': 0
+    }
+
+    for playlist in playlists:
+        migrate_playlist(conn, user_id, playlist, path_index, stats, dry_run)
+
+    return stats
+
+
 def print_path_samples(tracks: dict, path_index: dict, count: int = 5):
     """Print sample path matches for verification."""
     print("\n" + "="*80)
@@ -461,7 +866,7 @@ def print_path_samples(tracks: dict, path_index: dict, count: int = 5):
     print("="*80)
 
     samples = 0
-    for track_id, track in tracks.items():
+    for _, track in tracks.items():
         if samples >= count:
             break
 
@@ -484,6 +889,7 @@ def print_path_samples(tracks: dict, path_index: dict, count: int = 5):
             samples += 1
 
     print("\n" + "="*80)
+    sys.stdout.flush()  # Ensure output appears before subsequent log messages
 
 
 def print_summary(stats: dict, dry_run: bool, not_found_count: int, ambiguous_count: int, log_dir: str):
@@ -548,6 +954,115 @@ def validate_file_exists(path: str) -> str:
     return None
 
 
+def find_navidrome_db(directory: str = ".") -> list:
+    """
+    Scan directory for potential Navidrome database files.
+
+    Returns list of paths to .db files, prioritizing 'navidrome.db'.
+    """
+    db_files = []
+    try:
+        for filename in os.listdir(directory):
+            if filename.endswith('.db'):
+                filepath = os.path.join(directory, filename)
+                if os.path.isfile(filepath):
+                    # Prioritize navidrome.db by putting it first
+                    if filename.lower() == 'navidrome.db':
+                        db_files.insert(0, filepath)
+                    else:
+                        db_files.append(filepath)
+    except OSError:
+        pass
+    return db_files
+
+
+def find_itunes_xml(directory: str = ".") -> list:
+    """
+    Scan directory for potential iTunes Library XML files.
+
+    Returns list of paths to .xml files, prioritizing common iTunes names.
+    """
+    xml_files = []
+    priority_names = ['itunes music library.xml', 'itunes library.xml', 'library.xml']
+
+    try:
+        for filename in os.listdir(directory):
+            if filename.endswith('.xml'):
+                filepath = os.path.join(directory, filename)
+                if os.path.isfile(filepath):
+                    # Prioritize common iTunes library names
+                    if filename.lower() in priority_names:
+                        xml_files.insert(0, filepath)
+                    else:
+                        xml_files.append(filepath)
+    except OSError:
+        pass
+    return xml_files
+
+
+def prompt_file_with_autoscan(
+    prompt_name: str,
+    scan_func,
+    file_description: str
+) -> str:
+    """
+    Prompt for a file path with auto-scan support.
+
+    First scans current directory for matching files, lets user confirm or
+    enter a different path.
+    """
+    found_files = scan_func(".")
+
+    if found_files:
+        print(f"\n--- {prompt_name} ---")
+        print(f"Found {file_description} in current directory:")
+        for i, filepath in enumerate(found_files, 1):
+            print(f"  {i}. {filepath}")
+
+        while True:
+            if len(found_files) == 1:
+                response = input(f"\nUse this file? (Y/n) or enter path: ").strip()
+                if response.lower() in ['', 'y', 'yes']:
+                    return found_files[0]
+                elif response.lower() == 'n':
+                    # User wants to enter their own path
+                    return prompt_for_value(
+                        f"Path to {file_description}",
+                        validator=validate_file_exists
+                    )
+                elif os.path.exists(response):
+                    return response
+                else:
+                    print(f"  File not found: {response}")
+            else:
+                response = input(f"\nSelect number, or enter path: ").strip()
+
+                # Check if it's a number selecting from the list
+                try:
+                    idx = int(response)
+                    if 1 <= idx <= len(found_files):
+                        return found_files[idx - 1]
+                    else:
+                        print(f"  Please enter 1-{len(found_files)} or a file path.")
+                        continue
+                except ValueError:
+                    pass
+
+                # Check if it's a valid path
+                if response and os.path.exists(response):
+                    return response
+                elif response:
+                    print(f"  File not found: {response}")
+    else:
+        # No files found, prompt for path
+        print(f"\n--- {prompt_name} ---")
+        print(f"No {file_description} found in current directory.")
+        return prompt_for_value(
+            f"Path to {file_description}",
+            validator=validate_file_exists
+        )
+
+
 def list_navidrome_users(db_path: str) -> list:
     """List all users in the Navidrome database."""
     try:
@@ -563,22 +1078,22 @@ def list_navidrome_users(db_path: str) -> list:
 
 
 def interactive_get_arguments(args):
-    """Interactively prompt for any missing arguments."""
+    """Interactively prompt for any missing arguments with auto-scan support."""
 
-    # Navidrome database
+    # Navidrome database - auto-scan current directory
     if not args.navidrome_db:
-        print("\n--- Navidrome Database ---")
-        args.navidrome_db = prompt_for_value(
-            "Path to navidrome.db",
-            validator=validate_file_exists
+        args.navidrome_db = prompt_file_with_autoscan(
+            "Navidrome Database",
+            find_navidrome_db,
+            "navidrome.db"
         )
 
-    # iTunes XML
+    # iTunes XML - auto-scan current directory
     if not args.itunes_xml:
-        print("\n--- iTunes Library ---")
-        args.itunes_xml = prompt_for_value(
-            "Path to iTunes Library.xml",
-            validator=validate_file_exists
+        args.itunes_xml = prompt_file_with_autoscan(
+            "iTunes Library",
+            find_itunes_xml,
+            "iTunes Library.xml"
         )
 
     # User ID
@@ -622,20 +1137,179 @@ def interactive_get_arguments(args):
     return args
 
 
+# =============================================================================
+# Options Screen
+# =============================================================================
+
+def display_options_screen() -> ImportOptions:
+    """
+    Display interactive options screen and return selected options.
+
+    Returns ImportOptions with user selections.
+    """
+    options = ImportOptions()
+
+    def clear_screen():
+        """Clear terminal screen."""
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+    def draw_screen():
+        """Draw the options screen."""
+        clear_screen()
+        print("=" * 80)
+        print("iTunes to Navidrome Migration Tool")
+        print("=" * 80)
+        print()
+        print("Select import options (toggle with number key, Enter to proceed):")
+        print()
+
+        # Option 1: Play counts
+        check1 = "X" if options.import_play_counts else " "
+        print(f"  [{check1}] 1. Play counts")
+        print("         Transfers how many times each track was played")
+        print()
+
+        # Option 2: Ratings
+        check2 = "X" if options.import_ratings else " "
+        print(f"  [{check2}] 2. Ratings")
+        print("         Transfers star ratings (1-5 stars)")
+        print()
+
+        # Option 3: Play dates
+        check3 = "X" if options.import_play_dates else " "
+        print(f"  [{check3}] 3. Play dates")
+        print("         Transfers last played timestamps")
+        print()
+
+        # Option 4: Date added
+        check4 = "X" if options.import_date_added else " "
+        print(f"  [{check4}] 4. Date added")
+        print("         Transfers when tracks were added to library")
+        print()
+
+        # Option 5: Playlists
+        check5 = "X" if options.import_playlists else " "
+        print(f"  [{check5}] 5. Playlists")
+        print("         Creates playlists in Navidrome (smart playlists skipped)")
+        print()
+
+        print("-" * 80)
+        print("  [A] Toggle all    [Enter] Continue    [Q] Quit")
+        print("=" * 80)
+
+    def toggle_all():
+        """Toggle all options on or off."""
+        # If any option is off, turn all on. Otherwise turn all off.
+        all_on = (options.import_play_counts and options.import_ratings and
+                  options.import_play_dates and options.import_playlists and
+                  options.import_date_added)
+        if not all_on:
+            options.import_play_counts = True
+            options.import_ratings = True
+            options.import_play_dates = True
+            options.import_playlists = True
+            options.import_date_added = True
+        else:
+            options.import_play_counts = False
+            options.import_ratings = False
+            options.import_play_dates = False
+            options.import_playlists = False
+            options.import_date_added = False
+
+    # Try to use getch for single-key input, fall back to input() if not available
+    try:
+        import termios
+        import tty
+
+        def getch():
+            """Read a single character without requiring Enter."""
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            return ch
+
+        use_getch = True
+    except ImportError:
+        use_getch = False
+
+    while True:
+        draw_screen()
+
+        if use_getch:
+            key = getch().lower()
+        else:
+            key = input("\nEnter choice: ").strip().lower()
+            if not key:
+                key = '\r'  # Treat empty input as Enter
+
+        if key == '1':
+            options.import_play_counts = not options.import_play_counts
+        elif key == '2':
+            options.import_ratings = not options.import_ratings
+        elif key == '3':
+            options.import_play_dates = not options.import_play_dates
+        elif key == '4':
+            options.import_date_added = not options.import_date_added
+        elif key == '5':
+            options.import_playlists = not options.import_playlists
+        elif key == 'a':
+            toggle_all()
+        elif key in ('\r', '\n', ''):
+            # Enter key - proceed
+            any_selected = (options.import_play_counts or options.import_ratings or
+                           options.import_play_dates or options.import_playlists or
+                           options.import_date_added)
+            if not any_selected:
+                # No options selected - show message
+                print("\nNo options selected. Please select at least one option.")
+                if use_getch:
+                    print("Press any key to continue...")
+                    getch()
+                else:
+                    input("Press Enter to continue...")
+                continue
+            break
+        elif key == 'q':
+            print("\nAborted.")
+            sys.exit(0)
+
+    # Clear screen before returning
+    clear_screen()
+
+    return options
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Migrate iTunes play counts, ratings, and dates to Navidrome',
+        description='Migrate iTunes play counts, ratings, playlists, and dates to Navidrome',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Interactive mode (prompts for all required values)
+  # Interactive mode (shows options screen)
   python itunes_to_navidrome.py
 
-  # Basic usage (ADDS to existing play counts)
-  python itunes_to_navidrome.py navidrome.db "Library.xml" user123
+  # Import only ratings (non-interactive)
+  python itunes_to_navidrome.py navidrome.db "Library.xml" user123 --import-ratings
+
+  # Import play counts and ratings (no play dates)
+  python itunes_to_navidrome.py navidrome.db "Library.xml" user123 \\
+      --import-play-counts --import-ratings
+
+  # Import playlists
+  python itunes_to_navidrome.py navidrome.db "Library.xml" user123 --import-playlists
+
+  # Import everything (non-interactive)
+  python itunes_to_navidrome.py navidrome.db "Library.xml" user123 \\
+      --import-play-counts --import-ratings --import-play-dates \\
+      --import-playlists --import-date-added
 
   # Replace mode (OVERWRITES existing play counts)
-  python itunes_to_navidrome.py navidrome.db "Library.xml" user123 --replace
+  python itunes_to_navidrome.py navidrome.db "Library.xml" user123 \\
+      --import-play-counts --replace
 
   # Dry run (no changes)
   python itunes_to_navidrome.py navidrome.db "Library.xml" user123 --dry-run
@@ -647,6 +1321,8 @@ Notes:
   - Check not_found.log for tracks that couldn't be matched
   - Without --replace, running twice will DOUBLE play counts!
   - Album/artist play counts are aggregated from their tracks
+  - Smart playlists are skipped (cannot be converted to static)
+  - Existing playlists with same name are skipped
         """
     )
 
@@ -664,6 +1340,20 @@ Notes:
                         help='Skip confirmation prompt (for non-interactive use)')
     parser.add_argument('--sample', type=int, default=5,
                         help='Number of sample paths to show (default: 5)')
+
+    # New import options
+    parser.add_argument('--import-play-counts', action='store_true',
+                        help='Import play counts')
+    parser.add_argument('--import-ratings', action='store_true',
+                        help='Import star ratings')
+    parser.add_argument('--import-play-dates', action='store_true',
+                        help='Import last played timestamps')
+    parser.add_argument('--import-playlists', action='store_true',
+                        help='Import playlists from iTunes (smart playlists skipped)')
+    parser.add_argument('--import-date-added', action='store_true',
+                        help='Import "Date Added" timestamps')
+    parser.add_argument('--no-interactive', action='store_true',
+                        help='Skip interactive options screen (use CLI flags only)')
 
     args = parser.parse_args()
 
@@ -687,8 +1377,57 @@ Notes:
         logger.error(f"iTunes library not found: {args.itunes_xml}")
         sys.exit(1)
 
-    # Parse iTunes library
-    tracks = parse_itunes_library(args.itunes_xml)
+    # Determine import options
+    # If specific import flags are set, use those directly (non-interactive)
+    # Otherwise, show the options screen (unless --no-interactive)
+    any_import_flag = (args.import_play_counts or args.import_ratings or
+                       args.import_play_dates or args.import_playlists or
+                       args.import_date_added)
+
+    if any_import_flag or args.no_interactive:
+        # CLI mode - use flags directly
+        if any_import_flag:
+            # Use exactly what was specified
+            import_options = ImportOptions(
+                import_play_counts=args.import_play_counts,
+                import_ratings=args.import_ratings,
+                import_play_dates=args.import_play_dates,
+                import_playlists=args.import_playlists,
+                import_date_added=args.import_date_added
+            )
+        else:
+            # --no-interactive with no specific flags: default to play counts/ratings/dates
+            import_options = ImportOptions(
+                import_play_counts=True,
+                import_ratings=True,
+                import_play_dates=True,
+                import_playlists=False,
+                import_date_added=False
+            )
+    else:
+        # Interactive mode - show options screen
+        import_options = display_options_screen()
+
+    # Log selected options
+    logger.info(f"Import options: play_counts={import_options.import_play_counts}, "
+                f"ratings={import_options.import_ratings}, "
+                f"play_dates={import_options.import_play_dates}, "
+                f"playlists={import_options.import_playlists}, "
+                f"date_added={import_options.import_date_added}")
+
+    # Parse iTunes library (include playlists if needed)
+    if import_options.import_playlists:
+        tracks, playlists = parse_itunes_library(args.itunes_xml, include_playlists=True)
+    else:
+        tracks = parse_itunes_library(args.itunes_xml)
+        playlists = []
+
+    # Initialize stats variables (will be populated during migration)
+    stats = {'total': 0, 'matched': 0, 'not_found': 0, 'no_location': 0, 'no_data': 0, 'path_error': 0}
+    date_added_stats = None
+    playlist_stats = None
+    not_found_paths = []
+    ambiguous_matches = []
 
     # Connect to Navidrome database
     conn = sqlite3.connect(args.navidrome_db, isolation_level='DEFERRED')
@@ -739,44 +1478,63 @@ Notes:
         else:
             print("\n--yes flag set, skipping confirmation...")
 
-        # Initialize statistics
-        stats = {
-            'total': 0,
-            'matched': 0,
-            'not_found': 0,
-            'no_location': 0,
-            'no_data': 0,
-            'path_error': 0
-        }
+        # =====================================================================
+        # 1. Play counts, ratings, and play dates
+        # =====================================================================
+        if import_options.import_play_counts or import_options.import_ratings or import_options.import_play_dates:
+            # Build description of what's being imported
+            importing = []
+            if import_options.import_play_counts:
+                importing.append("Play Counts")
+            if import_options.import_ratings:
+                importing.append("Ratings")
+            if import_options.import_play_dates:
+                importing.append("Play Dates")
 
-        # Collect not-found paths in memory, write once at end
-        not_found_paths = []
+            print(f"\n--- Importing {', '.join(importing)} ---")
+            logger.info(f"Starting migration of: {', '.join(importing)}...")
 
-        # Collect ambiguous matches (tracks with multiple indistinguishable Navidrome matches)
-        ambiguous_matches = []
+            for _, track in tracks.items():
+                stats['total'] += 1
 
-        # Process tracks
-        logger.info("Starting migration...")
+                if not args.dry_run:
+                    migrate_track(
+                        conn, args.user_id, track,
+                        path_index, stats, not_found_paths, ambiguous_matches,
+                        import_options=import_options,
+                        replace_mode=args.replace,
+                        has_rated_at=has_rated_at
+                    )
+                else:
+                    # Dry run - use the same logic as migrate_track for accurate stats
+                    check_track_for_dry_run(
+                        track, path_index, stats, not_found_paths, ambiguous_matches,
+                        import_options=import_options
+                    )
 
-        for track_id, track in tracks.items():
-            stats['total'] += 1
+                # Progress indicator
+                if stats['total'] % 500 == 0:
+                    logger.info(f"Processed {stats['total']} tracks...")
 
-            if not args.dry_run:
-                migrate_track(
-                    conn, args.user_id, track,
-                    path_index, stats, not_found_paths, ambiguous_matches,
-                    replace_mode=args.replace,
-                    has_rated_at=has_rated_at
-                )
-            else:
-                # Dry run - use the same logic as migrate_track for accurate stats
-                check_track_for_dry_run(
-                    track, path_index, stats, not_found_paths, ambiguous_matches
-                )
+        # =====================================================================
+        # 2. Date added timestamps
+        # =====================================================================
+        if import_options.import_date_added:
+            print("\n--- Importing Date Added ---")
+            logger.info("Starting migration of: date added timestamps...")
+            date_added_stats = migrate_date_added(
+                conn, tracks, path_index, dry_run=args.dry_run
+            )
 
-            # Progress indicator
-            if stats['total'] % 500 == 0:
-                logger.info(f"Processed {stats['total']} tracks...")
+        # =====================================================================
+        # 3. Playlists
+        # =====================================================================
+        if import_options.import_playlists and playlists:
+            print("\n--- Importing Playlists ---")
+            logger.info("Starting migration of: playlists...")
+            playlist_stats = migrate_all_playlists(
+                conn, args.user_id, playlists, path_index, dry_run=args.dry_run
+            )
 
         # Commit changes
         if not args.dry_run:
@@ -810,8 +1568,66 @@ Notes:
                 entries.append('\n'.join(match_group))
             f.write('\n\n'.join(entries) + '\n')
 
-    # Print summary
-    print_summary(stats, args.dry_run, len(not_found_paths), len(ambiguous_matches), log_dir)
+    # Print and log summary
+    log_and_print("\n" + "=" * 80)
+    log_and_print("MIGRATION SUMMARY")
+    log_and_print("=" * 80)
+
+    # Play counts/ratings/play dates summary
+    if import_options.import_play_counts or import_options.import_ratings or import_options.import_play_dates:
+        # Build header showing what was imported
+        imported_items = []
+        if import_options.import_play_counts:
+            imported_items.append("Play Counts")
+        if import_options.import_ratings:
+            imported_items.append("Ratings")
+        if import_options.import_play_dates:
+            imported_items.append("Play Dates")
+        log_and_print(f"\n--- {', '.join(imported_items)} ---")
+        log_and_print(f"Total tracks in iTunes:     {stats['total']}")
+        log_and_print(f"Successfully matched:       {stats['matched']}")
+        log_and_print(f"Not found in Navidrome:     {stats['not_found']}")
+        log_and_print(f"No location in iTunes:      {stats['no_location']}")
+        log_and_print(f"No data to migrate:         {stats['no_data']}")
+        log_and_print(f"Path conversion errors:     {stats['path_error']}")
+        log_and_print(f"Ambiguous matches:          {len(ambiguous_matches)}")
+
+        # Calculate match rate based on tracks that actually have data to migrate
+        tracks_with_data = stats['total'] - stats['no_location'] - stats['no_data']
+        if tracks_with_data > 0:
+            match_rate = (stats['matched'] / tracks_with_data) * 100
+            log_and_print(f"Match rate (tracks w/data): {match_rate:.1f}%")
+
+    # Date added summary
+    if import_options.import_date_added and date_added_stats:
+        log_and_print("\n--- Date Added Timestamps ---")
+        log_and_print(f"Total tracks processed:     {date_added_stats['total']}")
+        log_and_print(f"Timestamps updated:         {date_added_stats['updated']}")
+        log_and_print(f"No date in iTunes:          {date_added_stats['no_date']}")
+        log_and_print(f"Not found in Navidrome:     {date_added_stats['not_found']}")
+
+    # Playlist summary
+    if import_options.import_playlists and playlist_stats:
+        log_and_print("\n--- Playlists ---")
+        log_and_print(f"Total playlists found:      {playlist_stats['total']}")
+        log_and_print(f"Playlists created:          {playlist_stats['created']}")
+        log_and_print(f"Skipped (already exists):   {playlist_stats['skipped_exists']}")
+        log_and_print(f"Skipped (no tracks found):  {playlist_stats['skipped_no_tracks']}")
+        log_and_print(f"Total tracks matched:       {playlist_stats['tracks_matched']}")
+        log_and_print(f"Total tracks unmatched:     {playlist_stats['tracks_unmatched']}")
+
+    log_and_print(f"\nLogs saved to: {log_dir}/")
+
+    if len(not_found_paths) > 0:
+        log_and_print(f"  - not_found.log ({len(not_found_paths)} unmatched tracks)")
+
+    if len(ambiguous_matches) > 0:
+        log_and_print(f"  - ambiguous_matches.log ({len(ambiguous_matches)} tracks with multiple possible matches)")
+
+    if args.dry_run:
+        log_and_print("\n*** This was a DRY RUN - no changes were made ***")
+        log_and_print("Run without --dry-run to apply changes")
+    log_and_print("=" * 80)
 
 
 if __name__ == '__main__':
