@@ -735,13 +735,12 @@ def create_playlist(
         VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
     """, (playlist_id, name, comment, owner_id, len(media_file_ids), total_duration, now, now))
 
-    # Insert playlist tracks with positions
-    for _, media_file_id in enumerate(media_file_ids):
-        track_entry_id = generate_playlist_id()
+    # Insert playlist tracks with positions (id is the track order, 0-indexed)
+    for position, media_file_id in enumerate(media_file_ids):
         cursor.execute("""
             INSERT INTO playlist_tracks (id, playlist_id, media_file_id)
             VALUES (?, ?, ?)
-        """, (track_entry_id, playlist_id, media_file_id))
+        """, (position, playlist_id, media_file_id))
 
     return playlist_id
 
